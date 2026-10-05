@@ -13,6 +13,9 @@
 #include "common/platform/sysTimer.h"
 #include "common/stringUtils.h"
 
+#include <algorithm>
+#include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -63,10 +66,73 @@ static DWORD GetCacheAccessType(sys_file_cache_type_t t) {
 	return FILE_ATTRIBUTE_NORMAL;
 }
 
+// ReadFile and WriteFile touch the caller's buffer from kernel mode. When that buffer is guest
+// memory the emulator has protected (GPU tracking), the call fails with ERROR_NOACCESS instead of
+// raising the user-mode fault the exception handler resolves, and the caller used to see a silent
+// zero-byte transfer (games then reject the file as broken). Retry such transfers through a host
+// buffer: the memcpy to or from guest memory faults in user mode, where the handler restores it.
+constexpr DWORD BOUNCE_CHUNK_SIZE = 1024u * 1024u;
+
+static uint64_t GetFilePosition(HANDLE handle) {
+	LARGE_INTEGER zero {};
+	LARGE_INTEGER pos {};
+	SetFilePointerEx(handle, zero, &pos, FILE_CURRENT);
+	return pos.QuadPart;
+}
+
+static void SetFilePosition(HANDLE handle, uint64_t offset) {
+	LARGE_INTEGER pos {};
+	pos.QuadPart = static_cast<LONGLONG>(offset);
+	SetFilePointerEx(handle, pos, nullptr, FILE_BEGIN);
+}
+
+static DWORD ReadFileBounced(HANDLE handle, uint8_t* data, uint32_t size) {
+	std::vector<uint8_t> chunk(std::min<DWORD>(size, BOUNCE_CHUNK_SIZE));
+	DWORD                total = 0;
+	while (total < size) {
+		const DWORD want = std::min<DWORD>(size - total, BOUNCE_CHUNK_SIZE);
+		DWORD       got  = 0;
+		if (ReadFile(handle, chunk.data(), want, &got, nullptr) == 0) {
+			break;
+		}
+		std::memcpy(data + total, chunk.data(), got);
+		total += got;
+		if (got < want) {
+			break;
+		}
+	}
+	return total;
+}
+
+static DWORD WriteFileBounced(HANDLE handle, const uint8_t* data, uint32_t size) {
+	std::vector<uint8_t> chunk(std::min<DWORD>(size, BOUNCE_CHUNK_SIZE));
+	DWORD                total = 0;
+	while (total < size) {
+		const DWORD count = std::min<DWORD>(size - total, BOUNCE_CHUNK_SIZE);
+		std::memcpy(chunk.data(), data + total, count);
+		DWORD put = 0;
+		if (WriteFile(handle, chunk.data(), count, &put, nullptr) == 0) {
+			break;
+		}
+		total += put;
+		if (put < count) {
+			break;
+		}
+	}
+	return total;
+}
+
 void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read) {
 	if (f.type == SYS_FILE_FILE) {
-		DWORD w = 0;
-		ReadFile(f.handle, data, size, &w, nullptr);
+		const auto start = GetFilePosition(f.handle);
+		DWORD      w     = 0;
+		if (ReadFile(f.handle, data, size, &w, nullptr) == 0 && GetLastError() == ERROR_NOACCESS) {
+			printf("File read: buffer %p (size 0x%08" PRIx32
+			       ") rejected by ReadFile, retrying through a host buffer\n",
+			       data, size);
+			SetFilePosition(f.handle, start);
+			w = ReadFileBounced(f.handle, static_cast<uint8_t*>(data), size);
+		}
 		if (bytes_read != nullptr) {
 			*bytes_read = w;
 		}
@@ -103,8 +169,15 @@ void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read)
 
 void SysFileWrite(const void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_written) {
 	if (f.type == SYS_FILE_FILE) {
-		DWORD w = 0;
-		WriteFile(f.handle, data, size, &w, nullptr);
+		const auto start = GetFilePosition(f.handle);
+		DWORD      w     = 0;
+		if (WriteFile(f.handle, data, size, &w, nullptr) == 0 && GetLastError() == ERROR_NOACCESS) {
+			printf("File write: buffer %p (size 0x%08" PRIx32
+			       ") rejected by WriteFile, retrying through a host buffer\n",
+			       data, size);
+			SetFilePosition(f.handle, start);
+			w = WriteFileBounced(f.handle, static_cast<const uint8_t*>(data), size);
+		}
 		if (bytes_written != nullptr) {
 			*bytes_written = w;
 		}
